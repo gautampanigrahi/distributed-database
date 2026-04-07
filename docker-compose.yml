@@ -1,0 +1,59 @@
+services:
+  shard0-leader:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=leader
+      - SHARD_ID=0
+      - NODE_ID=shard0-leader
+      - FOLLOWER_URL=http://shard0-follower:8000
+    ports:
+      - "8001:8000"
+
+  shard0-follower:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=follower
+      - SHARD_ID=0
+      - NODE_ID=shard0-follower
+    ports:
+      - "8002:8000"
+
+  shard1-leader:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=leader
+      - SHARD_ID=1
+      - NODE_ID=shard1-leader
+      - FOLLOWER_URL=http://shard1-follower:8000
+    ports:
+      - "8003:8000"
+
+  shard1-follower:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=follower
+      - SHARD_ID=1
+      - NODE_ID=shard1-follower
+    ports:
+      - "8004:8000"
+
+  coordinator:
+    build: .
+    command: uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - NUM_SHARDS=2
+      - SHARD_0_LEADER=http://shard0-leader:8000
+      - SHARD_0_FOLLOWER=http://shard0-follower:8000
+      - SHARD_1_LEADER=http://shard1-leader:8000
+      - SHARD_1_FOLLOWER=http://shard1-follower:8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - shard0-leader
+      - shard0-follower
+      - shard1-leader
+      - shard1-follower
