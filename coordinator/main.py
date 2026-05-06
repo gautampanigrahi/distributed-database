@@ -1,14 +1,27 @@
-"""Coordinator: single client-facing API that routes to shards.
+"""Coordinator: client-facing API + transaction coordinator.
 
-Routing:   shard_id = sha256(key) % num_shards
-Txns:      coordinator tracks which shards each txn touched.
+Responsibilities (mirroring the textbook's "transaction coordinator"):
 
-TODO(sprint2): two-phase commit for multi-shard atomicity,
-               leader re-election / retry on shard failure,
-               client-visible snapshot isolation.
+  1. Routing       — sha256(key) % N picks the shard for each key.
+  2. Concurrency   — strict two-phase locking on every read/write.
+                     Deadlocks are broken by timeout (presumed deadlock).
+  3. 2PC           — /commit runs Phase 1 (/prepare to every shard),
+                     persists a single decision in the WAL, then runs
+                     Phase 2 (/commit or /abort to each shard).
+  4. Recovery      — on startup, every recorded decision is re-broadcast
+                     (idempotent), and any shard's in-doubt prepared txn
+                     with no logged decision is presumed-aborted.
+  5. Failover      — a heartbeat task pings each leader; after K failures
+                     the follower is /promoted and the shard map updated.
+
+Everything below is organised in roughly that order.
 """
+import asyncio
+import os
+import threading
 import uuid
-from typing import Dict, Optional, Set
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Optional, Set
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -16,17 +29,214 @@ from pydantic import BaseModel
 
 from common.config import get_num_shards, get_shard_map
 from common.hashing import shard_for_key
+from common.locks import DeadlockTimeout, LockManager
+from common.wal import WAL
 
+# ---------------------------------------------------------------- config
 NUM_SHARDS = get_num_shards()
-SHARDS = get_shard_map()
+SHARDS: Dict[int, Dict[str, str]] = get_shard_map()
 
-app = FastAPI(title="Coordinator")
+LOCK_TIMEOUT_S = float(os.getenv("LOCK_TIMEOUT_S", "5"))
+HEARTBEAT_INTERVAL_S = float(os.getenv("HEARTBEAT_INTERVAL_S", "2"))
+LEADER_FAIL_THRESHOLD = int(os.getenv("LEADER_FAIL_THRESHOLD", "3"))
+WAL_DIR = os.getenv("WAL_DIR", "/data")
 
-# txn_id -> {"shards": set[int]}
-transactions: Dict[str, Dict] = {}
+# ---------------------------------------------------------------- state
+decision_log = WAL(os.path.join(WAL_DIR, "coordinator.wal"))
+locks = LockManager(timeout_s=LOCK_TIMEOUT_S)
+
+# Active transactions:
+#   txn_id -> {
+#       "shards":  set[int]                — participants we've touched
+#       "updates": dict[int, dict[k, v]]   — buffered writes per shard
+#                                            (sent to /prepare so a
+#                                            failed leader can be skipped)
+#   }
+transactions: Dict[str, Dict[str, Any]] = {}
+_txn_mu = threading.Lock()
+
+# Per-shard consecutive heartbeat-failure counter (used only by the
+# background task; never on the request path).
+_failure_count: Dict[int, int] = {sid: 0 for sid in SHARDS}
+_shutdown = asyncio.Event()
 
 
-# ------------------------------------------------------------------ models
+# ---------------------------------------------------------------- helpers
+def _leader(shard_id: int) -> str:
+    return SHARDS[shard_id]["leader"]
+
+
+def _post(url: str, json: Dict[str, Any], timeout: float = 5.0) -> httpx.Response:
+    return httpx.post(url, json=json, timeout=timeout)
+
+
+def _broadcast(endpoint: str, txn_id: str, participants: Set[int]) -> Dict[int, Any]:
+    """POST {leader}/<endpoint> {txn_id} to every participant. Best-effort:
+    we record per-shard outcomes but don't raise on individual failures —
+    the participant will reconcile via WAL replay if it crashed."""
+    out: Dict[int, Any] = {}
+    for sid in participants:
+        url = f"{_leader(sid)}/{endpoint}"
+        try:
+            r = _post(url, {"txn_id": txn_id}, timeout=10.0 if endpoint == "commit" else 5.0)
+            out[sid] = {
+                "ok": r.status_code == 200,
+                "status": r.status_code,
+                "body": r.json() if r.status_code == 200 else r.text,
+            }
+        except httpx.HTTPError as e:
+            out[sid] = {"ok": False, "error": str(e)}
+    return out
+
+
+def _forget_txn(txn_id: str) -> None:
+    """Drop coordinator-local state for a finished txn. Idempotent.
+    Callers must have already notified the shards (via 2PC phase 2 or
+    a direct /abort broadcast)."""
+    with _txn_mu:
+        transactions.pop(txn_id, None)
+    locks.release_all(txn_id)
+
+
+def _abort_txn(txn_id: str, participants: Optional[Set[int]] = None) -> None:
+    """End-to-end abort: broadcast /abort to shards then forget locally.
+    Used by deadlock-timeout, by /abort, and by 2PC's prepare-failed path."""
+    if participants is None:
+        with _txn_mu:
+            st = transactions.get(txn_id)
+            participants = set(st["shards"]) if st else set()
+    if participants:
+        _broadcast("abort", txn_id, participants)
+    _forget_txn(txn_id)
+
+
+def _acquire_or_abort(txn_id: str, sid: int, key: str, mode: str) -> None:
+    """Acquire a lock or abort the txn end-to-end on deadlock timeout."""
+    try:
+        locks.acquire(txn_id, (sid, key), mode)
+    except DeadlockTimeout as e:
+        _abort_txn(txn_id)
+        raise HTTPException(status_code=409, detail=f"deadlock-aborted: {e}")
+
+
+# ---------------------------------------------------------------- 2PC
+def _phase1_prepare(txn_id: str, participants: Set[int],
+                    updates: Dict[int, Dict[str, str]]) -> Dict[int, Dict[str, Any]]:
+    """Send /prepare to each leader and collect votes."""
+    votes: Dict[int, Dict[str, Any]] = {}
+    for sid in participants:
+        url = f"{_leader(sid)}/prepare"
+        body = {"txn_id": txn_id, "updates": updates.get(sid, {})}
+        try:
+            r = _post(url, body)
+            ready = r.status_code == 200 and r.json().get("vote") == "ready"
+            votes[sid] = (
+                {"ok": True, "vote": "ready"} if ready
+                else {"ok": False, "vote": "no", "status": r.status_code, "body": r.text}
+            )
+        except httpx.HTTPError as e:
+            votes[sid] = {"ok": False, "vote": "unreachable", "error": str(e)}
+    return votes
+
+
+def _record_decision(txn_id: str, decision: str, participants: Set[int],
+                     reason: Optional[str] = None) -> None:
+    rec = {"type": "decision", "txn_id": txn_id, "decision": decision,
+           "participants": sorted(participants)}
+    if reason:
+        rec["reason"] = reason
+    decision_log.append(rec)
+
+
+# ---------------------------------------------------------------- recovery
+def _recover() -> None:
+    """Replay coordinator decisions, then resolve shard in-doubt txns."""
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for rec in decision_log.replay():
+        if rec.get("type") == "decision":
+            decisions[rec["txn_id"]] = rec  # last write wins
+
+    # 1. Re-broadcast every decision (commit/abort is idempotent on shards).
+    for tid, rec in decisions.items():
+        _broadcast(rec["decision"], tid, set(rec.get("participants", [])))
+
+    # 2. Find prepared txns we have no record of and presume-abort them.
+    for sid in SHARDS:
+        try:
+            r = httpx.get(f"{_leader(sid)}/status", timeout=3.0)
+            in_doubt = r.json().get("in_doubt_txns", [])
+        except httpx.HTTPError:
+            continue
+        for tid in in_doubt:
+            if tid in decisions:
+                continue
+            try:
+                _post(f"{_leader(sid)}/abort", {"txn_id": tid}, timeout=3.0)
+            except httpx.HTTPError:
+                pass
+            _record_decision(tid, "abort", {sid}, reason="presumed-abort-on-recovery")
+
+
+# ---------------------------------------------------------------- heartbeat
+async def _heartbeat_loop() -> None:
+    """Ping every leader every HEARTBEAT_INTERVAL_S; promote follower
+    after LEADER_FAIL_THRESHOLD consecutive failures."""
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while not _shutdown.is_set():
+            for sid in list(SHARDS):
+                leader_url = SHARDS[sid]["leader"]
+                follower_url = SHARDS[sid]["follower"]
+                alive = False
+                try:
+                    r = await client.get(f"{leader_url}/health")
+                    alive = r.status_code == 200
+                except httpx.HTTPError:
+                    pass
+
+                if alive:
+                    _failure_count[sid] = 0
+                    continue
+
+                _failure_count[sid] += 1
+                if _failure_count[sid] >= LEADER_FAIL_THRESHOLD and follower_url:
+                    try:
+                        rp = await client.post(f"{follower_url}/promote",
+                                               json={"new_follower_url": None})
+                        if rp.status_code == 200:
+                            SHARDS[sid] = {"leader": follower_url, "follower": ""}
+                            _failure_count[sid] = 0
+                    except httpx.HTTPError:
+                        pass
+            try:
+                await asyncio.wait_for(_shutdown.wait(), timeout=HEARTBEAT_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+
+
+# ---------------------------------------------------------------- lifespan
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await asyncio.sleep(0.2)              # let shards finish booting in compose
+    try:
+        await asyncio.to_thread(_recover)
+    except Exception:
+        pass                              # recovery is best-effort
+    task = asyncio.create_task(_heartbeat_loop())
+    try:
+        yield
+    finally:
+        _shutdown.set()
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+app = FastAPI(title="Coordinator", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------- models
 class WriteReq(BaseModel):
     txn_id: str
     key: str
@@ -42,11 +252,7 @@ class TxnReq(BaseModel):
     txn_id: str
 
 
-def _leader(shard_id: int) -> str:
-    return SHARDS[shard_id]["leader"]
-
-
-# ------------------------------------------------------------------ endpoints
+# ---------------------------------------------------------------- endpoints
 @app.get("/cluster")
 def cluster():
     return {
@@ -54,37 +260,76 @@ def cluster():
         "shards": SHARDS,
         "hash_scheme": "sha256(key) % num_shards",
         "active_txns": len(transactions),
+        "lock_timeout_s": LOCK_TIMEOUT_S,
+        "heartbeat_interval_s": HEARTBEAT_INTERVAL_S,
+        "leader_fail_threshold": LEADER_FAIL_THRESHOLD,
     }
+
+
+@app.get("/locks")
+def lock_state():
+    return locks.snapshot()
+
+
+@app.get("/transactions")
+def list_transactions():
+    """UI hook: every active transaction and the shards/keys it has touched."""
+    with _txn_mu:
+        return {
+            tid: {"shards": sorted(st["shards"]), "updates": st["updates"]}
+            for tid, st in transactions.items()
+        }
+
+
+@app.get("/decisions")
+def recent_decisions(limit: int = 20):
+    """Last N committed/aborted txn decisions from the WAL. UI hook."""
+    records = [r for r in decision_log.replay() if r.get("type") == "decision"]
+    return {"decisions": records[-limit:]}
 
 
 @app.post("/begin")
 def begin():
     txn_id = str(uuid.uuid4())
-    transactions[txn_id] = {"shards": set()}
+    with _txn_mu:
+        transactions[txn_id] = {"shards": set(), "updates": {}}
     return {"txn_id": txn_id}
 
 
 @app.post("/write")
 def write(req: WriteReq):
-    if req.txn_id not in transactions:
-        raise HTTPException(status_code=400, detail="unknown txn_id; call /begin first")
+    with _txn_mu:
+        if req.txn_id not in transactions:
+            raise HTTPException(status_code=400, detail="unknown txn_id; call /begin first")
     sid = shard_for_key(req.key, NUM_SHARDS)
-    url = _leader(sid)
+
+    _acquire_or_abort(req.txn_id, sid, req.key, "X")
+
     try:
-        r = httpx.post(f"{url}/write", json=req.model_dump(), timeout=5.0)
+        r = _post(f"{_leader(sid)}/write", req.model_dump())
         r.raise_for_status()
     except httpx.HTTPError as e:
+        # Locks stay held — the client can /abort to release them.
         raise HTTPException(status_code=502, detail=f"shard {sid} write failed: {e}")
-    transactions[req.txn_id]["shards"].add(sid)
+
+    with _txn_mu:
+        st = transactions[req.txn_id]
+        st["shards"].add(sid)
+        st["updates"].setdefault(sid, {})[req.key] = req.value
     return {"ok": True, "shard_id": sid, "result": r.json()}
 
 
 @app.post("/read")
 def read(req: ReadReq):
     sid = shard_for_key(req.key, NUM_SHARDS)
-    url = _leader(sid)
+    if req.txn_id:
+        with _txn_mu:
+            if req.txn_id not in transactions:
+                raise HTTPException(status_code=400, detail="unknown txn_id")
+        _acquire_or_abort(req.txn_id, sid, req.key, "S")
+
     try:
-        r = httpx.post(f"{url}/read", json=req.model_dump(), timeout=5.0)
+        r = _post(f"{_leader(sid)}/read", req.model_dump())
         r.raise_for_status()
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"shard {sid} read failed: {e}")
@@ -95,47 +340,66 @@ def read(req: ReadReq):
 
 @app.post("/commit")
 def commit(req: TxnReq):
-    if req.txn_id not in transactions:
-        raise HTTPException(status_code=400, detail="unknown txn_id")
-    touched: Set[int] = transactions[req.txn_id]["shards"]
+    """Two-phase commit across the txn's participating shards."""
+    with _txn_mu:
+        if req.txn_id not in transactions:
+            raise HTTPException(status_code=400, detail="unknown txn_id")
+        st = transactions[req.txn_id]
+        participants: Set[int] = set(st["shards"])
+        per_shard_updates: Dict[int, Dict[str, str]] = {
+            sid: dict(u) for sid, u in st["updates"].items()
+        }
 
-    # TODO(sprint2): replace this best-effort loop with real 2PC
-    # (prepare phase across all shards, then commit phase). Today,
-    # if shard N fails after shard N-1 succeeded we are left partial.
-    results = {}
-    failed = []
-    for sid in touched:
-        url = _leader(sid)
-        try:
-            r = httpx.post(
-                f"{url}/commit", json={"txn_id": req.txn_id}, timeout=10.0
-            )
-            if r.status_code != 200:
-                failed.append({"shard": sid, "error": r.text})
-            else:
-                results[sid] = r.json()
-        except httpx.HTTPError as e:
-            failed.append({"shard": sid, "error": str(e)})
+    # Empty txn: nothing to do.
+    if not participants:
+        _forget_txn(req.txn_id)
+        return {"ok": True, "decision": "commit", "committed_shards": [],
+                "votes": {}, "results": {}, "note": "empty txn"}
 
-    del transactions[req.txn_id]
-    if failed:
-        raise HTTPException(
-            status_code=500,
-            detail={"message": "commit failed", "failed": failed, "partial": results},
-        )
-    return {"ok": True, "committed_shards": sorted(touched), "results": results}
+    # Phase 1
+    votes = _phase1_prepare(req.txn_id, participants, per_shard_updates)
+    all_ready = all(v.get("vote") == "ready" for v in votes.values())
+
+    # Decision (this is the durable point of no return)
+    decision = "commit" if all_ready else "abort"
+    _record_decision(req.txn_id, decision, participants,
+                     reason=None if all_ready else "prepare-failed")
+
+    # Phase 2
+    results = _broadcast(decision, req.txn_id, participants)
+
+    # Free local state regardless of phase-2 outcome — the WAL decision
+    # is authoritative; participants will reconcile on restart.
+    _forget_txn(req.txn_id)
+
+    if decision == "abort":
+        raise HTTPException(status_code=409, detail={
+            "message": "commit aborted in prepare phase",
+            "votes": votes, "aborts": results,
+        })
+
+    if not all(v.get("ok") for v in results.values()):
+        raise HTTPException(status_code=500, detail={
+            "message": "commit decided but some participants did not ack",
+            "votes": votes, "results": results,
+        })
+
+    return {
+        "ok": True, "decision": "commit",
+        "committed_shards": sorted(participants),
+        "votes": votes, "results": results,
+    }
 
 
 @app.post("/abort")
 def abort(req: TxnReq):
-    if req.txn_id not in transactions:
-        raise HTTPException(status_code=400, detail="unknown txn_id")
-    touched = transactions[req.txn_id]["shards"]
-    for sid in touched:
-        url = _leader(sid)
-        try:
-            httpx.post(f"{url}/abort", json={"txn_id": req.txn_id}, timeout=5.0)
-        except httpx.HTTPError:
-            pass  # best-effort; abort is idempotent
-    del transactions[req.txn_id]
-    return {"ok": True, "aborted_shards": sorted(touched)}
+    with _txn_mu:
+        if req.txn_id not in transactions:
+            raise HTTPException(status_code=400, detail="unknown txn_id")
+        participants: Set[int] = set(transactions[req.txn_id]["shards"])
+
+    if participants:
+        _record_decision(req.txn_id, "abort", participants, reason="client-abort")
+    results = _broadcast("abort", req.txn_id, participants)
+    _forget_txn(req.txn_id)
+    return {"ok": True, "aborted_shards": sorted(participants), "results": results}

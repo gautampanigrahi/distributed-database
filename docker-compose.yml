@@ -7,6 +7,9 @@ services:
       - SHARD_ID=0
       - NODE_ID=shard0-leader
       - FOLLOWER_URL=http://shard0-follower:8000
+      - WAL_DIR=/data
+    volumes:
+      - shard0-leader-data:/data
     ports:
       - "8001:8000"
 
@@ -17,6 +20,9 @@ services:
       - ROLE=follower
       - SHARD_ID=0
       - NODE_ID=shard0-follower
+      - WAL_DIR=/data
+    volumes:
+      - shard0-follower-data:/data
     ports:
       - "8002:8000"
 
@@ -28,6 +34,9 @@ services:
       - SHARD_ID=1
       - NODE_ID=shard1-leader
       - FOLLOWER_URL=http://shard1-follower:8000
+      - WAL_DIR=/data
+    volumes:
+      - shard1-leader-data:/data
     ports:
       - "8003:8000"
 
@@ -38,6 +47,9 @@ services:
       - ROLE=follower
       - SHARD_ID=1
       - NODE_ID=shard1-follower
+      - WAL_DIR=/data
+    volumes:
+      - shard1-follower-data:/data
     ports:
       - "8004:8000"
 
@@ -50,6 +62,12 @@ services:
       - SHARD_0_FOLLOWER=http://shard0-follower:8000
       - SHARD_1_LEADER=http://shard1-leader:8000
       - SHARD_1_FOLLOWER=http://shard1-follower:8000
+      - LOCK_TIMEOUT_S=5
+      - HEARTBEAT_INTERVAL_S=2
+      - LEADER_FAIL_THRESHOLD=3
+      - WAL_DIR=/data
+    volumes:
+      - coordinator-data:/data
     ports:
       - "8000:8000"
     depends_on:
@@ -57,3 +75,10 @@ services:
       - shard0-follower
       - shard1-leader
       - shard1-follower
+
+volumes:
+  shard0-leader-data:
+  shard0-follower-data:
+  shard1-leader-data:
+  shard1-follower-data:
+  coordinator-data:
