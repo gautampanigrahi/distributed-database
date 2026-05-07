@@ -17,7 +17,8 @@ demo:
 No state of its own. Quit with Ctrl-C.
 """
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 from rich.console import Console
@@ -29,12 +30,28 @@ from rich.text import Text
 
 # ---------------------------------------------------------------- config
 COORDINATOR = "http://localhost:8000"
-NODES = [
+DEFAULT_NODES = [
     ("shard0-leader",   "http://localhost:8001"),
     ("shard0-follower", "http://localhost:8002"),
-    ("shard1-leader",   "http://localhost:8003"),
-    ("shard1-follower", "http://localhost:8004"),
+    ("shard0-follower-2", "http://localhost:8003"),
+    ("shard1-leader",   "http://localhost:8004"),
+    ("shard1-follower", "http://localhost:8005"),
+    ("shard1-follower-2", "http://localhost:8006"),
+    ("shard2-leader",   "http://localhost:8007"),
+    ("shard2-follower", "http://localhost:8008"),
+    ("shard2-follower-2", "http://localhost:8009"),
 ]
+LOCAL_PORTS = {
+    "shard0-leader": 8001,
+    "shard0-follower": 8002,
+    "shard0-follower-2": 8003,
+    "shard1-leader": 8004,
+    "shard1-follower": 8005,
+    "shard1-follower-2": 8006,
+    "shard2-leader": 8007,
+    "shard2-follower": 8008,
+    "shard2-follower-2": 8009,
+}
 REFRESH_S = 0.5
 HTTP_TIMEOUT = 0.4   # tight: we'd rather show "unreachable" than block the loop
 
@@ -49,6 +66,38 @@ def fetch(url: str) -> Optional[Dict[str, Any]]:
     except httpx.HTTPError:
         pass
     return None
+
+
+def current_nodes() -> List[Tuple[str, str]]:
+    info = fetch(f"{COORDINATOR}/cluster")
+    if not info:
+        return DEFAULT_NODES
+
+    shards = info.get("shards") or {}
+    nodes: List[Tuple[str, str]] = list(DEFAULT_NODES)
+    seen = {name for name, _base in nodes}
+    for sid in sorted(shards, key=lambda item: int(item)):
+        shard = shards[sid]
+        for url in [shard.get("leader")] + list(shard.get("followers") or []):
+            if not url:
+                continue
+            service = urlparse(url).hostname
+            port = LOCAL_PORTS.get(service or "")
+            if service and port and service not in seen:
+                nodes.append((service, f"http://localhost:{port}"))
+                seen.add(service)
+    return nodes or DEFAULT_NODES
+
+
+def lag_by_service() -> Dict[str, Dict[str, Any]]:
+    data = fetch(f"{COORDINATOR}/replication-lag") or {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for shard in (data.get("shards") or {}).values():
+        for node in shard.get("nodes", []):
+            service = urlparse(node.get("url", "")).hostname
+            if service:
+                out[service] = node
+    return out
 
 
 # ---------------------------------------------------------------- panels
@@ -69,7 +118,7 @@ def coordinator_panel() -> Panel:
                  border_style="green", padding=(0, 1))
 
 
-def node_panel(name: str, base: str) -> Panel:
+def node_panel(name: str, base: str, lag: Optional[Dict[str, Any]] = None) -> Panel:
     h = fetch(f"{base}/health")
     if not h:
         return Panel(Text("unreachable", style="bold red"),
@@ -85,14 +134,20 @@ def node_panel(name: str, base: str) -> Panel:
     body = Text()
     body.append("role        : ")
     body.append(f"{role}\n", style=f"bold {border}")
-    body.append(f"committed   : {h.get('committed_keys', 0)}\n")
+    records = h.get("record_count", h.get("committed_keys", 0))
+    lag_count = (lag or {}).get("lag_from_leader")
+    body.append(f"records     : {records}\n")
+    if lag_count is not None:
+        lag_style = "bold red" if lag_count > 0 else "bold green"
+        body.append("lag         : ")
+        body.append(f"{lag_count}\n", style=lag_style)
     body.append(f"open txns   : {h.get('open_txns', 0)}\n")
     body.append("prepared    : ")
     body.append(f"{prepared}\n",
                 style="bold yellow" if prepared > 0 else "default")
-    follower = h.get("follower_url")
-    if follower:
-        body.append(f"replicates →: {follower.split('//')[-1]}", style="dim")
+    followers = h.get("follower_urls") or ([h["follower_url"]] if h.get("follower_url") else [])
+    if followers:
+        body.append(f"replicates →: {len(followers)} follower(s)", style="dim")
     return Panel(body, title=name, border_style=border, padding=(0, 1))
 
 
@@ -166,7 +221,7 @@ def decisions_panel() -> Panel:
 
 # ---------------------------------------------------------------- layout
 def build_layout() -> Layout:
-    """Top: coordinator. Middle: 4 shard nodes side by side.
+    """Top: coordinator. Middle: shard nodes side by side.
     Bottom: txns + locks + decisions."""
     root = Layout()
     root.split_column(
@@ -178,7 +233,7 @@ def build_layout() -> Layout:
                               title="cluster", border_style="dim"))
 
     nodes_row = root["nodes"]
-    nodes_row.split_row(*[Layout(name=f"node{i}") for i in range(len(NODES))])
+    nodes_row.split_row(*[Layout(name=f"node{i}") for i in range(len(current_nodes()))])
 
     bottom = root["bottom"]
     bottom.split_row(
@@ -191,8 +246,9 @@ def build_layout() -> Layout:
 
 def render(layout: Layout) -> None:
     layout["head"].update(coordinator_panel())
-    for i, (name, base) in enumerate(NODES):
-        layout[f"node{i}"].update(node_panel(name, base))
+    lag = lag_by_service()
+    for i, (name, base) in enumerate(current_nodes()):
+        layout[f"node{i}"].update(node_panel(name, base, lag.get(name)))
     layout["txns"].update(transactions_table())
     layout["locks"].update(locks_panel())
     layout["decisions"].update(decisions_panel())

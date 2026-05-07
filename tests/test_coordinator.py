@@ -204,3 +204,27 @@ def test_explicit_abort_releases_locks(cluster):
     assert coord.locks.snapshot()["held_by_txn"]
     c.post("/abort", json={"txn_id": txn})
     assert coord.locks.snapshot()["held_by_txn"] == {}
+
+
+def test_non_transactional_read_uses_follower(cluster):
+    c = _client()
+    key = "follower-read"
+    sid = coord.shard_for_key(key, coord.NUM_SHARDS)
+    r = c.post("/read", json={"key": key})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["read_mode"] == "eventual-follower"
+    assert body["routed_to"] == coord.SHARDS[sid]["followers"][0]
+
+
+def test_transactional_read_uses_leader_and_lock(cluster):
+    c = _client()
+    key = "leader-read"
+    sid = coord.shard_for_key(key, coord.NUM_SHARDS)
+    txn = c.post("/begin").json()["txn_id"]
+    r = c.post("/read", json={"txn_id": txn, "key": key})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["read_mode"] == "transactional-leader"
+    assert body["routed_to"] == coord.SHARDS[sid]["leader"]
+    assert coord.locks.snapshot()["held_by_txn"][txn]

@@ -21,7 +21,7 @@ import os
 import threading
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -34,7 +34,11 @@ from common.wal import WAL
 
 # ---------------------------------------------------------------- config
 NUM_SHARDS = get_num_shards()
-SHARDS: Dict[int, Dict[str, str]] = get_shard_map()
+SHARDS: Dict[int, Dict[str, Any]] = get_shard_map()
+CONFIGURED_REPLICAS: Dict[int, List[str]] = {
+    sid: [cfg["leader"]] + list(cfg.get("followers", []))
+    for sid, cfg in SHARDS.items()
+}
 
 LOCK_TIMEOUT_S = float(os.getenv("LOCK_TIMEOUT_S", "5"))
 HEARTBEAT_INTERVAL_S = float(os.getenv("HEARTBEAT_INTERVAL_S", "2"))
@@ -66,8 +70,88 @@ def _leader(shard_id: int) -> str:
     return SHARDS[shard_id]["leader"]
 
 
+def _followers(shard_id: int) -> List[str]:
+    return list(SHARDS[shard_id].get("followers", []))
+
+
+def _unique_urls(urls: List[str]) -> List[str]:
+    out: List[str] = []
+    for url in urls:
+        if url and url not in out:
+            out.append(url)
+    return out
+
+
+def _replica_candidates(shard_id: int) -> List[str]:
+    current = [_leader(shard_id)] + _followers(shard_id)
+    return _unique_urls(CONFIGURED_REPLICAS.get(shard_id, []) + current)
+
+
+def _replica_priority(shard_id: int, url: str) -> int:
+    candidates = _replica_candidates(shard_id)
+    return candidates.index(url) if url in candidates else -1
+
+
+def _set_shard_replicas(shard_id: int, leader: str, followers: List[str]) -> None:
+    SHARDS[shard_id] = {
+        "leader": leader,
+        "followers": followers,
+        "follower": followers[0] if followers else "",
+    }
+
+
 def _post(url: str, json: Dict[str, Any], timeout: float = 5.0) -> httpx.Response:
     return httpx.post(url, json=json, timeout=timeout)
+
+
+def _read_from_node(base_url: str, shard_id: int, req: "ReadReq", read_mode: str) -> Dict[str, Any]:
+    r = _post(f"{base_url}/read", req.model_dump())
+    r.raise_for_status()
+    out = r.json()
+    out["shard_id"] = shard_id
+    out["read_mode"] = read_mode
+    out["routed_to"] = base_url
+    return out
+
+
+def _replication_lag_snapshot() -> Dict[str, Any]:
+    shards: Dict[int, Any] = {}
+    for sid in sorted(SHARDS):
+        nodes = []
+        leader_records: Optional[int] = None
+        for url in _replica_candidates(sid):
+            node = {
+                "url": url,
+                "is_current_leader": url == _leader(sid),
+                "reachable": False,
+                "role": None,
+                "record_count": None,
+                "lag_from_leader": None,
+            }
+            try:
+                r = httpx.get(f"{url}/health", timeout=1.0)
+                if r.status_code == 200:
+                    h = r.json()
+                    node["reachable"] = True
+                    node["role"] = h.get("role")
+                    node["record_count"] = h.get("record_count", h.get("committed_keys"))
+                    if url == _leader(sid):
+                        leader_records = node["record_count"]
+            except httpx.HTTPError:
+                pass
+            nodes.append(node)
+        if leader_records is None:
+            counts = [n["record_count"] for n in nodes if n["record_count"] is not None]
+            leader_records = max(counts) if counts else None
+        for node in nodes:
+            if leader_records is not None and node["record_count"] is not None:
+                node["lag_from_leader"] = max(0, leader_records - node["record_count"])
+        shards[sid] = {
+            "leader": _leader(sid),
+            "leader_record_count": leader_records,
+            "nodes": nodes,
+        }
+    return {"shards": shards}
 
 
 def _broadcast(endpoint: str, txn_id: str, participants: Set[int]) -> Dict[int, Any]:
@@ -179,17 +263,16 @@ def _recover() -> None:
 
 # ---------------------------------------------------------------- heartbeat
 async def _heartbeat_loop() -> None:
-    """Ping every leader every HEARTBEAT_INTERVAL_S; promote follower
-    after LEADER_FAIL_THRESHOLD consecutive failures."""
+    """Ping every leader every HEARTBEAT_INTERVAL_S; elect a reachable
+    replica after LEADER_FAIL_THRESHOLD consecutive failures."""
     async with httpx.AsyncClient(timeout=2.0) as client:
         while not _shutdown.is_set():
             for sid in list(SHARDS):
                 leader_url = SHARDS[sid]["leader"]
-                follower_url = SHARDS[sid]["follower"]
                 alive = False
                 try:
                     r = await client.get(f"{leader_url}/health")
-                    alive = r.status_code == 200
+                    alive = r.status_code == 200 and r.json().get("role") == "leader"
                 except httpx.HTTPError:
                     pass
 
@@ -198,12 +281,34 @@ async def _heartbeat_loop() -> None:
                     continue
 
                 _failure_count[sid] += 1
-                if _failure_count[sid] >= LEADER_FAIL_THRESHOLD and follower_url:
+                if _failure_count[sid] >= LEADER_FAIL_THRESHOLD:
+                    candidates = sorted(
+                        _replica_candidates(sid),
+                        key=lambda url: _replica_priority(sid, url),
+                        reverse=True,
+                    )
+                    reachable = []
+                    for candidate_url in candidates:
+                        try:
+                            hr = await client.get(f"{candidate_url}/health")
+                            if hr.status_code == 200:
+                                reachable.append(candidate_url)
+                        except httpx.HTTPError:
+                            pass
+                    if not reachable:
+                        continue
+                    elected = reachable[0]
+                    remaining_followers = [url for url in reachable if url != elected]
                     try:
-                        rp = await client.post(f"{follower_url}/promote",
-                                               json={"new_follower_url": None})
+                        rp = await client.post(
+                            f"{elected}/promote",
+                            json={
+                                "new_follower_url": remaining_followers[0] if remaining_followers else None,
+                                "new_follower_urls": remaining_followers,
+                            },
+                        )
                         if rp.status_code == 200:
-                            SHARDS[sid] = {"leader": follower_url, "follower": ""}
+                            _set_shard_replicas(sid, elected, remaining_followers)
                             _failure_count[sid] = 0
                     except httpx.HTTPError:
                         pass
@@ -264,6 +369,24 @@ def cluster():
         "heartbeat_interval_s": HEARTBEAT_INTERVAL_S,
         "leader_fail_threshold": LEADER_FAIL_THRESHOLD,
     }
+
+
+@app.get("/leader-validity")
+def leader_validity(shard_id: int, node_url: str):
+    if shard_id not in SHARDS:
+        raise HTTPException(status_code=404, detail="unknown shard")
+    current_leader = _leader(shard_id)
+    return {
+        "shard_id": shard_id,
+        "node_url": node_url,
+        "current_leader": current_leader,
+        "valid": current_leader == node_url,
+    }
+
+
+@app.get("/replication-lag")
+def replication_lag():
+    return _replication_lag_snapshot()
 
 
 @app.get("/locks")
@@ -327,15 +450,22 @@ def read(req: ReadReq):
             if req.txn_id not in transactions:
                 raise HTTPException(status_code=400, detail="unknown txn_id")
         _acquire_or_abort(req.txn_id, sid, req.key, "S")
+        try:
+            return _read_from_node(_leader(sid), sid, req, "transactional-leader")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"shard {sid} read failed: {e}")
 
+    errors = []
+    for follower_url in _followers(sid):
+        try:
+            return _read_from_node(follower_url, sid, req, "eventual-follower")
+        except httpx.HTTPError as e:
+            errors.append(f"{follower_url}: {e}")
     try:
-        r = _post(f"{_leader(sid)}/read", req.model_dump())
-        r.raise_for_status()
+        return _read_from_node(_leader(sid), sid, req, "committed-leader-fallback")
     except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"shard {sid} read failed: {e}")
-    out = r.json()
-    out["shard_id"] = sid
-    return out
+        errors.append(f"{_leader(sid)}: {e}")
+        raise HTTPException(status_code=502, detail=f"shard {sid} read failed: {'; '.join(errors)}")
 
 
 @app.post("/commit")
