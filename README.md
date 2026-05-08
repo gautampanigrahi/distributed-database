@@ -1,204 +1,426 @@
-# Distributed Database — Sprints 1 & 2
+# Distributed Database Final Project
 
-A scalable, fault-tolerant key–value store built around the architectural
-checklist in our project proposal:
+A distributed, sharded key-value database implemented in Python with FastAPI and Docker Compose. The system supports hash-based sharding, multi-follower replication, transactional writes, two-phase commit, strict two-phase locking, follower reads, failover, write-ahead logging, and a live dashboard for observing the cluster.
 
-* hash-based **sharding** with a coordinator gateway
-* synchronous **leader → follower replication**
-* **strict two-phase locking** with timeout-based deadlock handling
-* **two-phase commit** for atomic multi-shard transactions
-* **write-ahead logging** on every shard and on the coordinator, with
-  on-restart **recovery** for both participant in-doubt txns and
-  coordinator decisions
-* heartbeat-driven **leader failover** to a follower replica
-* **CP** semantics: when a replica cannot be reached, writes fail
-  rather than diverge
+## Team Members
 
-Built with FastAPI + httpx + Docker Compose.
+- Gautam Panigrahi
+- Ankush Chandrashekar
 
-## Architecture
+## Project Overview
 
+The database is organized around a coordinator and multiple shard replicas. Clients send requests to the coordinator. The coordinator routes keys to shards using deterministic SHA-256 hashing, manages transaction state, applies strict two-phase locking, and runs two-phase commit for multi-shard transactions.
+
+Each shard has one leader and multiple followers. Writes go through the shard leader and are replicated to followers. Non-transactional reads can be served by followers for better read scalability, while transactional reads continue to use the leader path to preserve lock-based consistency and read-your-own-writes behavior.
+
+The default Docker Compose topology is:
+
+| Component | Host Port | Role |
+|---|---:|---|
+| coordinator | 8000 | client API, transaction coordinator, lock manager |
+| shard0-leader | 8001 | shard 0 leader |
+| shard0-follower | 8002 | shard 0 follower |
+| shard0-follower-2 | 8003 | shard 0 follower |
+| shard1-leader | 8004 | shard 1 leader |
+| shard1-follower | 8005 | shard 1 follower |
+| shard1-follower-2 | 8006 | shard 1 follower |
+| shard2-leader | 8007 | shard 2 leader |
+| shard2-follower | 8008 | shard 2 follower |
+| shard2-follower-2 | 8009 | shard 2 follower |
+
+## Features
+
+- Hash-based sharding using `sha256(key) % num_shards`
+- Coordinator-based transaction routing
+- Strict two-phase locking with shared and exclusive locks
+- Timeout-based deadlock handling
+- Two-phase commit across shards
+- Write-ahead logging for coordinator decisions and shard state
+- Leader-to-follower replication
+- Configurable multiple followers per shard
+- Non-transactional follower reads with leader fallback
+- Transactional reads routed through leaders
+- Read-your-own-writes inside transactions
+- Heartbeat-based failover
+- Coordinator-driven leader election among replicas
+- Stale restarted leader self-demotion
+- Replication lag and record-count monitoring
+- Terminal dashboard
+- Evaluation scripts and HTML eval report generation
+
+## Requirements
+
+Install these before running the project:
+
+- Docker Desktop or Docker Engine with Docker Compose
+- Python 3.11 recommended
+- `pip`
+
+The Python dependencies are listed in `requirements.txt`:
+
+```bash
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+httpx==0.27.2
+pydantic==2.9.2
+pytest==8.3.3
+rich==13.9.4
 ```
-                  ┌────────────────────────────┐
-   clients  ─────▶│         Coordinator        │  :8000
-                  │                            │
-                  │  • routes by sha256(key)%N │
-                  │  • strict 2PL lock manager │
-                  │  • 2PC orchestrator        │
-                  │  • decision WAL + recovery │
-                  │  • heartbeat → failover    │
-                  └──┬───────────┬──────────────┘
-                     │           │
-            shard 0  │           │  shard 1
-            ┌────────▼─────┐  ┌──▼───────────┐
-            │  leader      │  │  leader      │  :8001 / :8003
-            │   wal        │  │   wal        │
-            │     │        │  │     │        │
-            │     ▼  /repl │  │     ▼  /repl │  sync replication
-            │  follower    │  │  follower    │  :8002 / :8004
-            │   wal        │  │   wal        │
-            └──────────────┘  └──────────────┘
+
+## Compile and Setup Instructions
+
+This is a Python project, so there is no separate compilation step. The setup step is installing dependencies and building the Docker images.
+
+Create and activate a virtual environment:
+
+```bash
+python3.11 -m venv .venv311
+source .venv311/bin/activate
+pip install -r requirements.txt
 ```
 
-| Node              | Host port | Role     |
-|-------------------|-----------|----------|
-| coordinator       | 8000      | router + tx coordinator |
-| shard0-leader     | 8001      | leader   |
-| shard0-follower   | 8002      | follower |
-| shard1-leader     | 8003      | leader   |
-| shard1-follower   | 8004      | follower |
+If `python3.11` is not available, use:
 
-## Mapping proposal → implementation
+```bash
+python3 -m venv .venv311
+source .venv311/bin/activate
+pip install -r requirements.txt
+```
 
-| Proposal mechanism                                | File                       |
-|---------------------------------------------------|----------------------------|
-| Sharding (hash-based)                             | `common/hashing.py`        |
-| Query routing                                     | `coordinator/main.py`      |
-| Synchronous primary–follower replication          | `shard/main.py /commit`    |
-| Leader management / failover                      | `coordinator/main.py _heartbeat_loop` + `shard/main.py /promote` |
-| Strict two-phase locking                          | `common/locks.py`          |
-| Timeout-based deadlock handling                   | `common/locks.py DeadlockTimeout` |
-| Transaction lifecycle                             | `coordinator/main.py /begin /write /read /commit /abort` |
-| Two-phase commit                                  | `coordinator/main.py /commit` + `shard/main.py /prepare /commit /abort` |
-| Write propagation pipeline                        | `shard/main.py /replicate` |
-| Coordinator decision recovery                     | `coordinator/main.py _recover()` + `coordinator.wal` |
-| Participant prepared-state recovery               | `shard/main.py _recover_from_wal()` + per-node WAL |
-| Node health monitoring                            | `coordinator/main.py _heartbeat_loop` |
-| CP behavior (block/fail rather than diverge)      | replication is synchronous; commit fails if follower unreachable |
+Build the Docker services:
 
-## Running
+```bash
+docker compose build
+```
+
+## Running the Distributed Database
+
+Start the full cluster:
 
 ```bash
 docker compose up --build
 ```
 
-Wait until all five services report healthy on `/health`. Then in a
-second terminal launch the **live dashboard** (the focal point of the
-demo):
+Or run it in the background:
+
+```bash
+docker compose up -d --build
+```
+
+Check the coordinator:
+
+```bash
+curl http://localhost:8000/cluster
+```
+
+Stop the cluster:
+
+```bash
+docker compose down
+```
+
+To remove persistent database state and start fresh:
+
+```bash
+docker compose down -v
+```
+
+## Running the Dashboard
+
+The dashboard shows coordinator state, shard health, leader/follower roles, record counts, replication lag, active transactions, locks, and recent two-phase commit decisions.
+
+Run:
+
+```bash
+.venv311/bin/python dashboard.py
+```
+
+If your virtual environment is named `.venv`, run:
 
 ```bash
 .venv/bin/python dashboard.py
 ```
 
-It refreshes every 500 ms and shows:
+## Running Client Commands
 
-* the coordinator's config + active-txn counter
-* one panel per node — role, committed keys, prepared (in-doubt) txns
-* every active transaction (id, shards touched, buffered writes)
-* every held lock (S/X mode and which txn holds it) plus the
-  deadlock-timeout counter
-* the most recent 2PC decisions from the coordinator's WAL
+The CLI client talks to the coordinator at `http://localhost:8000` by default.
 
-Colour code: **green** = healthy leader, **cyan** = healthy follower,
-**yellow** = leader with in-doubt prepared txns, **red** = unreachable.
-
-In a third terminal exercise the cluster:
+Begin a transaction:
 
 ```bash
-.venv/bin/python demo.py
+.venv311/bin/python client.py begin
 ```
 
-`demo.py` walks four scenarios:
-
-1. A 2-shard, 5-key transaction via **2PC** (prepare → commit phase)
-2. Two transactions racing on the same key — the second is **deadlock-aborted** by the lock manager's timeout
-3. An explicit abort that discards uncommitted writes
-4. A snapshot of each shard's per-node state (committed keys, prepared txns)
-
-## Demo flow (5 minutes)
-
-| t   | What you do                                       | What the dashboard shows                                                |
-|-----|---------------------------------------------------|-------------------------------------------------------------------------|
-| 0:00| `docker compose up` + `python dashboard.py`       | All 5 nodes go green                                                    |
-| 0:30| `python demo.py` scenario 1 (2PC commit)          | Both shards' `committed` counter ticks up together; a `commit` row appears in *recent 2PC decisions* |
-| 1:30| Two manual transactions racing on one key         | Locks panel shows the X-holder; conflicting txn 409s with `deadlock-aborted`; deadlock-timeout counter increments |
-| 2:30| `docker compose stop shard1-leader`               | shard1-leader panel turns **red**. ~6s later, shard1-follower's role flips to `leader` and its border turns **green** |
-| 3:30| Run another commit hitting shard 1                | Succeeds against the promoted node                                      |
-| 4:00| `docker compose start shard1-leader`              | Comes back, replays WAL, `committed` matches the rest                   |
-
-## Manual API smoke-test
+Write a value inside a transaction:
 
 ```bash
-curl http://localhost:8000/cluster
-curl http://localhost:8000/locks      # current lock manager state
-
-TXN=$(curl -s -XPOST http://localhost:8000/begin | python -c 'import sys,json;print(json.load(sys.stdin)["txn_id"])')
-curl -s -XPOST http://localhost:8000/write \
-     -H 'content-type: application/json' \
-     -d "{\"txn_id\":\"$TXN\",\"key\":\"user:1\",\"value\":\"alice\"}"
-curl -s -XPOST http://localhost:8000/commit \
-     -H 'content-type: application/json' \
-     -d "{\"txn_id\":\"$TXN\"}"
-curl -s -XPOST http://localhost:8000/read \
-     -H 'content-type: application/json' \
-     -d '{"key":"user:1"}'
+.venv311/bin/python client.py write <txn_id> user:1 alice
 ```
 
-Inspect a shard's WAL-derived state:
+Commit a transaction:
 
 ```bash
-curl http://localhost:8001/data       # shard 0 leader
-curl http://localhost:8001/status     # any in-doubt prepared txns
+.venv311/bin/python client.py commit <txn_id>
 ```
 
-## Observing recovery
+Abort a transaction:
 
 ```bash
-# 1. Run the demo to populate state.
-python demo.py
-
-# 2. Restart any one shard:
-docker compose restart shard1-leader
-
-# 3. Confirm its committed state survived (WAL replayed):
-curl http://localhost:8003/data
+.venv311/bin/python client.py abort <txn_id>
 ```
 
-To exercise leader failover:
+Run a non-transactional read:
+
+```bash
+.venv311/bin/python client.py read user:1
+```
+
+Run a transactional read:
+
+```bash
+.venv311/bin/python client.py read-tx <txn_id> user:1
+```
+
+Inspect cluster state:
+
+```bash
+.venv311/bin/python client.py cluster
+```
+
+Inspect locks:
+
+```bash
+.venv311/bin/python client.py locks
+```
+
+Inspect recent two-phase commit decisions:
+
+```bash
+.venv311/bin/python client.py decisions --limit 20
+```
+
+## Manual API Example
+
+Start a transaction, write a key, commit it, and read it back:
+
+```bash
+TXN=$(curl -s -X POST http://localhost:8000/begin | python3 -c 'import json,sys; print(json.load(sys.stdin)["txn_id"])')
+
+curl -s -X POST http://localhost:8000/write \
+  -H 'content-type: application/json' \
+  -d "{\"txn_id\":\"$TXN\",\"key\":\"user:1\",\"value\":\"alice\"}"
+
+curl -s -X POST http://localhost:8000/commit \
+  -H 'content-type: application/json' \
+  -d "{\"txn_id\":\"$TXN\"}"
+
+curl -s -X POST http://localhost:8000/read \
+  -H 'content-type: application/json' \
+  -d '{"key":"user:1"}'
+```
+
+## Demonstrating Key Behaviors
+
+### Follower Reads
+
+Non-transactional reads are optimized to use followers when available:
+
+```bash
+.venv311/bin/python client.py read user:1
+```
+
+The response includes fields such as:
+
+```json
+{
+  "read_mode": "eventual-follower",
+  "routed_to": "http://shard0-follower:8000"
+}
+```
+
+If followers are unavailable, the coordinator falls back to the leader.
+
+### Transactional Reads
+
+Transactional reads use the leader and acquire shared locks:
+
+```bash
+.venv311/bin/python client.py read-tx <txn_id> user:1
+```
+
+The response includes:
+
+```json
+{
+  "read_mode": "transactional-leader"
+}
+```
+
+### Two-Phase Commit
+
+A transaction that writes keys across multiple shards is committed using two-phase commit. The coordinator first sends `prepare` requests, records the final decision in its WAL, and then sends `commit` or `abort` to all participant shards.
+
+### Locking
+
+Reads inside transactions acquire shared locks. Writes acquire exclusive locks. Conflicting transactions wait until the lock is available or abort after the configured timeout.
+
+### Failover
+
+To demonstrate leader failover:
 
 ```bash
 docker compose stop shard1-leader
-# Wait LEADER_FAIL_THRESHOLD * HEARTBEAT_INTERVAL_S (~6s by default).
-curl http://localhost:8000/cluster   # SHARDS[1].leader is now the old follower URL.
 ```
 
-## Tests
+After the heartbeat threshold is reached, the coordinator elects a reachable replica and promotes it. Check the new leader with:
 
 ```bash
-.venv/bin/python -m pytest -v
+curl http://localhost:8000/cluster
 ```
 
-24 tests covering: hashing, WAL, lock manager (S/X compatibility,
-timeout-based deadlock, upgrade), shard endpoints (write/read/commit,
-2PC prepare path, abort, replicate, promote, WAL recovery), and
-coordinator endpoints (2PC happy path, abort path, deadlock-abort,
-explicit abort lock release).
+Restart the old leader:
 
-## File layout
+```bash
+docker compose start shard1-leader
+```
 
+The restarted node checks with the coordinator and demotes itself if it is no longer the valid leader.
+
+## Replication Lag Monitoring
+
+The coordinator exposes replication lag and record counts:
+
+```bash
+curl -s http://localhost:8000/replication-lag | python3 -m json.tool
 ```
-distributed-database/
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── README.md
-├── MILESTONE_1_REPORT.md
-├── MILESTONE_2_REPORT.md
-├── demo.py                # scripted scenarios for the live demo
-├── dashboard.py           # rich.live TUI — operator-style monitor
-├── common/
-│   ├── hashing.py        # sha256-based shard mapping
-│   ├── config.py         # env-driven topology
-│   ├── locks.py          # strict 2PL + timeout deadlock
-│   └── wal.py            # append-only JSON-lines WAL
-├── coordinator/
-│   └── main.py           # client API, 2PC, locks, recovery, heartbeat
-├── shard/
-│   └── main.py           # leader/follower with WAL + 2PC participant API
-└── tests/
-    ├── test_hashing.py
-    ├── test_wal.py
-    ├── test_locks.py
-    ├── test_shard.py
-    └── test_coordinator.py
+
+Each node reports:
+
+- `record_count`
+- `lag_from_leader`
+- `role`
+- `reachable`
+- `is_current_leader`
+
+The dashboard also displays `records` and `lag` for each shard node.
+
+## Running Tests
+
+Run the test suite:
+
+```bash
+.venv311/bin/python -m pytest -q
 ```
+
+The tests cover:
+
+- deterministic hashing
+- write-ahead logging
+- shared and exclusive lock behavior
+- timeout-based deadlock handling
+- shard write/read/prepare/commit/abort behavior
+- replication
+- promotion
+- coordinator two-phase commit behavior
+- abort handling
+- transactional and non-transactional read routing
+
+## Running Performance Evals
+
+Run all evals:
+
+```bash
+PYTHON_BIN=.venv311/bin/python ./run_evals.sh
+```
+
+The script writes JSON results to:
+
+```text
+eval-results/<timestamp>/
+```
+
+It also generates an HTML report:
+
+```text
+eval-results/<timestamp>/report.html
+```
+
+Open the report:
+
+```bash
+open eval-results/<timestamp>/report.html
+```
+
+Run a single baseline eval:
+
+```bash
+.venv311/bin/python evals.py baseline --workload reads --clients 16 --requests 500
+```
+
+Run a contention eval:
+
+```bash
+.venv311/bin/python evals.py contention --clients 8 --requests 50 --hot-key employee:hot
+```
+
+Generate a report manually:
+
+```bash
+.venv311/bin/python eval_report.py eval-results/<timestamp>
+```
+
+## Important Files
+
+| File | Purpose |
+|---|---|
+| `docker-compose.yml` | Defines the coordinator, shard leaders, and shard followers |
+| `coordinator/main.py` | Coordinator API, routing, locking, 2PC, failover, leader validity, replication lag |
+| `shard/main.py` | Shard participant API, WAL recovery, replication, promotion, self-demotion |
+| `common/hashing.py` | Deterministic shard hashing |
+| `common/config.py` | Environment-driven shard topology configuration |
+| `common/locks.py` | Strict two-phase lock manager |
+| `common/wal.py` | Append-only JSON-lines write-ahead log |
+| `client.py` | Command-line client |
+| `dashboard.py` | Live terminal dashboard |
+| `evals.py` | Performance and contention eval workloads |
+| `eval_report.py` | HTML report generator for eval results |
+| `run_evals.sh` | Shell script to run all evals |
+| `tests/` | Unit and integration-style tests |
+
+## External Libraries and Resources
+
+This project uses standard open-source Python libraries for web services, testing, and terminal visualization:
+
+- FastAPI
+- Uvicorn
+- httpx
+- Pydantic
+- pytest
+- Rich
+
+These libraries are used as infrastructure dependencies. The distributed database logic, transaction coordination, locking, replication, failover, dashboard integration, and eval scripts were implemented as project work.
+
+## Group Member Contributions
+
+### Gautam Panigrahi
+
+Gautam worked on the core distributed transaction design and implementation. His responsibilities included the coordinator-side transaction lifecycle, two-phase commit orchestration, participant tracking, write-ahead decision logging, recovery behavior, and integration of strict two-phase locking with the transaction API. He also contributed to the testing strategy for coordinator behavior, commit/abort correctness, deadlock timeout handling, and multi-shard transaction validation.
+
+### Ankush Chandrashekar
+
+Ankush worked on the replication, availability, observability, and evaluation portions of the system. His responsibilities included multi-shard and multi-follower Docker topology, follower replication support, leader failover, leader validity checks, stale leader self-demotion, follower-read routing, replication lag monitoring, dashboard updates, command-line workflows, performance eval scripts, and the HTML eval report generator. He also contributed to validation, demo preparation, and operational scripts for running and testing the system.
+
+## Notes for Grading
+
+To run the complete system from a clean checkout:
+
+```bash
+python3.11 -m venv .venv311
+source .venv311/bin/activate
+pip install -r requirements.txt
+docker compose up -d --build
+.venv311/bin/python -m pytest -q
+.venv311/bin/python dashboard.py
+```
+
+In another terminal, use `client.py` or `run_evals.sh` to exercise the system.
