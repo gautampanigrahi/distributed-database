@@ -1,4 +1,4 @@
-# Distributed Database Final Project
+# Distributed Database Key Value Store
 
 A distributed, sharded key-value database implemented in Python with FastAPI and Docker Compose. The system supports hash-based sharding, multi-follower replication, transactional writes, two-phase commit, strict two-phase locking, follower reads, failover, write-ahead logging, and a live dashboard for observing the cluster.
 
@@ -6,6 +6,17 @@ A distributed, sharded key-value database implemented in Python with FastAPI and
 
 - Gautam Panigrahi
 - Ankush Chandrashekar
+
+## Group Member Contributions
+
+### Gautam Panigrahi
+
+Gautam worked on the core distributed transaction design and implementation. His responsibilities included the coordinator-side transaction lifecycle, two-phase commit orchestration, participant tracking, write-ahead decision logging, recovery behavior, and integration of strict two-phase locking with the transaction API. He also contributed to the testing strategy for coordinator behavior, commit/abort correctness, deadlock timeout handling, and multi-shard transaction validation.
+
+### Ankush Chandrashekar
+
+Ankush worked on the replication, availability, observability, and evaluation portions of the system. His responsibilities included multi-shard and multi-follower Docker topology, follower replication support, leader failover, leader validity checks, stale leader self-demotion, follower-read routing, replication lag monitoring, dashboard updates, command-line workflows, performance eval scripts, and the HTML eval report generator. He also contributed to validation, demo preparation, and operational scripts for running and testing the system.
+
 
 ## Project Overview
 
@@ -400,27 +411,4 @@ This project uses standard open-source Python libraries for web services, testin
 
 These libraries are used as infrastructure dependencies. The distributed database logic, transaction coordination, locking, replication, failover, dashboard integration, and eval scripts were implemented as project work.
 
-## Group Member Contributions
 
-### Gautam Panigrahi
-
-Gautam worked on the core distributed transaction design and implementation. His responsibilities included the coordinator-side transaction lifecycle, two-phase commit orchestration, participant tracking, write-ahead decision logging, recovery behavior, and integration of strict two-phase locking with the transaction API. He also contributed to the testing strategy for coordinator behavior, commit/abort correctness, deadlock timeout handling, and multi-shard transaction validation.
-
-### Ankush Chandrashekar
-
-Ankush worked on the replication, availability, observability, and evaluation portions of the system. His responsibilities included multi-shard and multi-follower Docker topology, follower replication support, leader failover, leader validity checks, stale leader self-demotion, follower-read routing, replication lag monitoring, dashboard updates, command-line workflows, performance eval scripts, and the HTML eval report generator. He also contributed to validation, demo preparation, and operational scripts for running and testing the system.
-
-## Notes for Grading
-
-To run the complete system from a clean checkout:
-
-```bash
-python3.11 -m venv .venv311
-source .venv311/bin/activate
-pip install -r requirements.txt
-docker compose up -d --build
-.venv311/bin/python -m pytest -q
-.venv311/bin/python dashboard.py
-```
-
-In another terminal, use `client.py` or `run_evals.sh` to exercise the system.
