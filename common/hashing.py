@@ -1,10 +1,3 @@
-"""Deterministic hashing utilities.
-
-We deliberately do NOT use Python's built-in hash() because it is
-randomized per-process (PYTHONHASHSEED) and will produce different
-shard assignments across nodes. We use sha256 so every node in the
-cluster maps a given key to the same shard.
-"""
 import hashlib
 
 

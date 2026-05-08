@@ -1,21 +1,8 @@
-"""Shard node: behaves as leader OR follower (chosen by ROLE env var).
-
-Acts as a 2PC participant for the coordinator:
-    /write         → stage updates in memory (no log yet)
-    /prepare       → log <prepare T, updates>, fsync, vote ready
-    /commit        → log <commit T>, replicate to follower, apply
-    /abort         → log <abort T>, drop staged/prepared
-    /replicate     → leader pushes committed updates to its follower
-
-Recovery: on import, the WAL is replayed to rebuild committed/prepared
-state. Any txn with a <prepare T> but no <commit T>/<abort T> is left
-in-doubt and exposed via /status; the coordinator resolves it.
-
-Failover: a follower can be promoted to leader via /promote.
-"""
 import os
 import threading
-from typing import Dict, Optional
+import time
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -28,6 +15,10 @@ ROLE = os.getenv("ROLE", "leader")           # initial role only; /promote can c
 SHARD_ID = int(os.getenv("SHARD_ID", "0"))
 NODE_ID = os.getenv("NODE_ID", f"shard{SHARD_ID}-{ROLE}")
 FOLLOWER_URL = os.getenv("FOLLOWER_URL", "")
+FOLLOWER_URLS = os.getenv("FOLLOWER_URLS", FOLLOWER_URL)
+COORDINATOR_URL = os.getenv("COORDINATOR_URL", "")
+SELF_URL = os.getenv("SELF_URL", "")
+LEADER_VALIDITY_INTERVAL_S = float(os.getenv("LEADER_VALIDITY_INTERVAL_S", "2"))
 WAL_DIR = os.getenv("WAL_DIR", "/data")
 WAL_PATH = os.path.join(WAL_DIR, f"{NODE_ID}.wal")
 
@@ -39,7 +30,8 @@ staged: Dict[str, Dict[str, str]] = {}       # txn -> {key: value}, before /prep
 prepared: Dict[str, Dict[str, str]] = {}     # txn -> {key: value}, after /prepare (in-doubt)
 
 _role: str = ROLE                            # mutable: /promote can change to "leader"
-_follower_url: str = FOLLOWER_URL
+_follower_urls: List[str] = [url.strip() for url in FOLLOWER_URLS.split(",") if url.strip()]
+_shutdown = threading.Event()
 
 wal = WAL(WAL_PATH)
 
@@ -76,6 +68,40 @@ def _require_leader() -> None:
         raise HTTPException(status_code=403, detail=f"node is {_role}, not leader")
 
 
+def _demote_if_stale() -> bool:
+    global _role, _follower_urls
+    if not COORDINATOR_URL or not SELF_URL:
+        return False
+    with _mu:
+        if _role != "leader":
+            return False
+    try:
+        r = httpx.get(
+            f"{COORDINATOR_URL.rstrip('/')}/leader-validity",
+            params={"shard_id": SHARD_ID, "node_url": SELF_URL},
+            timeout=2.0,
+        )
+        if r.status_code != 200:
+            return False
+        valid = bool(r.json().get("valid"))
+    except httpx.HTTPError:
+        return False
+    if valid:
+        return False
+    with _mu:
+        if _role == "leader":
+            _role = "follower"
+            _follower_urls = []
+            return True
+    return False
+
+
+def _leader_validity_loop() -> None:
+    while not _shutdown.is_set():
+        _demote_if_stale()
+        _shutdown.wait(LEADER_VALIDITY_INTERVAL_S)
+
+
 def _do_prepare(txn_id: str, updates: Dict[str, str]) -> None:
     """Persist a prepare record and move the txn into 'prepared' state.
     Caller must hold _mu."""
@@ -84,24 +110,25 @@ def _do_prepare(txn_id: str, updates: Dict[str, str]) -> None:
     staged.pop(txn_id, None)
 
 
-def _replicate_to_follower(txn_id: str, updates: Dict[str, str]) -> None:
-    """Push committed updates to follower. Raises HTTPException if it
+def _replicate_to_followers(txn_id: str, updates: Dict[str, str]) -> None:
+    """Push committed updates to followers. Raises HTTPException if it
     cannot be reached / refuses; caller decides whether to apply locally."""
-    if not _follower_url:
+    if not _follower_urls:
         return
-    try:
-        r = httpx.post(
-            f"{_follower_url}/replicate",
-            json={"updates": updates, "txn_id": txn_id},
-            timeout=5.0,
-        )
-        if r.status_code != 200:
-            raise HTTPException(
-                status_code=500,
-                detail=f"follower rejected replicate: {r.status_code} {r.text}",
+    failures = []
+    for follower_url in _follower_urls:
+        try:
+            r = httpx.post(
+                f"{follower_url}/replicate",
+                json={"updates": updates, "txn_id": txn_id},
+                timeout=5.0,
             )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"follower unreachable: {e}")
+            if r.status_code != 200:
+                failures.append(f"{follower_url}: {r.status_code} {r.text}")
+        except httpx.RequestError as e:
+            failures.append(f"{follower_url}: unreachable: {e}")
+    if failures:
+        raise HTTPException(status_code=500, detail={"replication_failures": failures})
 
 
 # ---------------------------------------------------------------- models
@@ -134,10 +161,23 @@ class ReplicateReq(BaseModel):
 
 class PromoteReq(BaseModel):
     new_follower_url: Optional[str] = None
+    new_follower_urls: Optional[List[str]] = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _demote_if_stale()
+    t = threading.Thread(target=_leader_validity_loop, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        _shutdown.set()
+        t.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------- app
-app = FastAPI(title=f"Shard {SHARD_ID} ({ROLE})")
+app = FastAPI(title=f"Shard {SHARD_ID} ({ROLE})", lifespan=lifespan)
 
 
 # ---- introspection ----------------------------------------------------
@@ -150,9 +190,13 @@ def health():
             "shard_id": SHARD_ID,
             "ok": True,
             "committed_keys": len(committed),
+            "record_count": len(committed),
             "open_txns": len(staged),
             "prepared_txns": len(prepared),
-            "follower_url": _follower_url or None,
+            "follower_url": _follower_urls[0] if _follower_urls else None,
+            "follower_urls": list(_follower_urls),
+            "coordinator_url": COORDINATOR_URL or None,
+            "self_url": SELF_URL or None,
         }
 
 
@@ -241,7 +285,7 @@ def commit(req: TxnReq):
         wal.append({"type": "commit", "txn_id": req.txn_id})
 
         try:
-            _replicate_to_follower(req.txn_id, updates)
+            _replicate_to_followers(req.txn_id, updates)
         except HTTPException:
             # Decision is already durable; apply locally so we don't
             # diverge from the WAL, then surface the replication error.
@@ -283,11 +327,13 @@ def promote(req: PromoteReq):
     """Convert this node from follower to leader. Called by the
     coordinator's failover routine. After promotion the new leader runs
     solo until a fresh follower URL is supplied."""
-    global _role, _follower_url
+    global _role, _follower_urls
     with _mu:
-        if _role == "leader":
-            return {"ok": True, "note": "already leader", "node": NODE_ID}
         _role = "leader"
-        _follower_url = req.new_follower_url or ""
+        if req.new_follower_urls is not None:
+            _follower_urls = list(req.new_follower_urls)
+        else:
+            _follower_urls = [req.new_follower_url] if req.new_follower_url else []
         return {"ok": True, "promoted": NODE_ID,
-                "follower_url": _follower_url or None}
+                "follower_url": _follower_urls[0] if _follower_urls else None,
+                "follower_urls": list(_follower_urls)}

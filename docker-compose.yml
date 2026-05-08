@@ -6,7 +6,9 @@ services:
       - ROLE=leader
       - SHARD_ID=0
       - NODE_ID=shard0-leader
-      - FOLLOWER_URL=http://shard0-follower:8000
+      - FOLLOWER_URLS=http://shard0-follower:8000,http://shard0-follower-2:8000
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard0-leader:8000
       - WAL_DIR=/data
     volumes:
       - shard0-leader-data:/data
@@ -20,11 +22,28 @@ services:
       - ROLE=follower
       - SHARD_ID=0
       - NODE_ID=shard0-follower
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard0-follower:8000
       - WAL_DIR=/data
     volumes:
       - shard0-follower-data:/data
     ports:
       - "8002:8000"
+
+  shard0-follower-2:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=follower
+      - SHARD_ID=0
+      - NODE_ID=shard0-follower-2
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard0-follower-2:8000
+      - WAL_DIR=/data
+    volumes:
+      - shard0-follower-2-data:/data
+    ports:
+      - "8003:8000"
 
   shard1-leader:
     build: .
@@ -33,12 +52,14 @@ services:
       - ROLE=leader
       - SHARD_ID=1
       - NODE_ID=shard1-leader
-      - FOLLOWER_URL=http://shard1-follower:8000
+      - FOLLOWER_URLS=http://shard1-follower:8000,http://shard1-follower-2:8000
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard1-leader:8000
       - WAL_DIR=/data
     volumes:
       - shard1-leader-data:/data
     ports:
-      - "8003:8000"
+      - "8004:8000"
 
   shard1-follower:
     build: .
@@ -47,22 +68,87 @@ services:
       - ROLE=follower
       - SHARD_ID=1
       - NODE_ID=shard1-follower
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard1-follower:8000
       - WAL_DIR=/data
     volumes:
       - shard1-follower-data:/data
     ports:
-      - "8004:8000"
+      - "8005:8000"
+
+  shard1-follower-2:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=follower
+      - SHARD_ID=1
+      - NODE_ID=shard1-follower-2
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard1-follower-2:8000
+      - WAL_DIR=/data
+    volumes:
+      - shard1-follower-2-data:/data
+    ports:
+      - "8006:8000"
+
+  shard2-leader:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=leader
+      - SHARD_ID=2
+      - NODE_ID=shard2-leader
+      - FOLLOWER_URLS=http://shard2-follower:8000,http://shard2-follower-2:8000
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard2-leader:8000
+      - WAL_DIR=/data
+    volumes:
+      - shard2-leader-data:/data
+    ports:
+      - "8007:8000"
+
+  shard2-follower:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=follower
+      - SHARD_ID=2
+      - NODE_ID=shard2-follower
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard2-follower:8000
+      - WAL_DIR=/data
+    volumes:
+      - shard2-follower-data:/data
+    ports:
+      - "8008:8000"
+
+  shard2-follower-2:
+    build: .
+    command: uvicorn shard.main:app --host 0.0.0.0 --port 8000
+    environment:
+      - ROLE=follower
+      - SHARD_ID=2
+      - NODE_ID=shard2-follower-2
+      - COORDINATOR_URL=http://coordinator:8000
+      - SELF_URL=http://shard2-follower-2:8000
+      - WAL_DIR=/data
+    volumes:
+      - shard2-follower-2-data:/data
+    ports:
+      - "8009:8000"
 
   coordinator:
     build: .
     command: uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
     environment:
-      - NUM_SHARDS=2
+      - NUM_SHARDS=3
       - SHARD_0_LEADER=http://shard0-leader:8000
-      - SHARD_0_FOLLOWER=http://shard0-follower:8000
+      - SHARD_0_FOLLOWERS=http://shard0-follower:8000,http://shard0-follower-2:8000
       - SHARD_1_LEADER=http://shard1-leader:8000
-      - SHARD_1_FOLLOWER=http://shard1-follower:8000
-      - LOCK_TIMEOUT_S=5
+      - SHARD_1_FOLLOWERS=http://shard1-follower:8000,http://shard1-follower-2:8000
+      - SHARD_2_LEADER=http://shard2-leader:8000
+      - SHARD_2_FOLLOWERS=http://shard2-follower:8000,http://shard2-follower-2:8000
+      - LOCK_TIMEOUT_S=15
       - HEARTBEAT_INTERVAL_S=2
       - LEADER_FAIL_THRESHOLD=3
       - WAL_DIR=/data
@@ -73,12 +159,22 @@ services:
     depends_on:
       - shard0-leader
       - shard0-follower
+      - shard0-follower-2
       - shard1-leader
       - shard1-follower
+      - shard1-follower-2
+      - shard2-leader
+      - shard2-follower
+      - shard2-follower-2
 
 volumes:
   shard0-leader-data:
   shard0-follower-data:
+  shard0-follower-2-data:
   shard1-leader-data:
   shard1-follower-data:
+  shard1-follower-2-data:
+  shard2-leader-data:
+  shard2-follower-data:
+  shard2-follower-2-data:
   coordinator-data:
