@@ -1,17 +1,3 @@
-"""Append-only JSON-lines write-ahead log (the textbook's "stable-storage log").
-
-Used by:
-  * each shard node — per-txn prepare / commit / abort / replicate records
-  * the coordinator — final 2PC decision records
-
-Format:
-  one JSON object per line, fsync'd after every append. A torn final
-  line (from a crash mid-write) is silently skipped on replay.
-
-Why fsync on every append: the textbook's 2PC correctness proof
-requires that <prepare T> and <commit T> records be on stable storage
-*before* the protocol moves on. A buffered write isn't enough.
-"""
 import json
 import os
 import threading

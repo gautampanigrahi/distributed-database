@@ -1,21 +1,3 @@
-"""Live cluster dashboard. Run on the host while `docker compose up` runs.
-
-Polls the coordinator (cluster / transactions / locks / decisions) and
-each shard node (health) every REFRESH_S seconds, and renders a
-multi-panel terminal view. Designed to be the focal point of the live
-demo:
-
-  * 2PC commit:   both shard panels' `committed` counter ticks up
-                  together; a row appears in `recent decisions`.
-  * Concurrency:  the locks panel shows the X-holder; conflicting
-                  attempts disappear with a `deadlock-aborted` 409.
-  * Failover:     stop a leader container — its panel turns red, the
-                  follower's role flips to leader (panel turns green)
-                  about LEADER_FAIL_THRESHOLD * HEARTBEAT_INTERVAL_S
-                  seconds later.
-
-No state of its own. Quit with Ctrl-C.
-"""
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse

@@ -1,9 +1,3 @@
-"""Shard unit tests using FastAPI's TestClient.
-
-We point the WAL at a tempdir per test module and configure the shard
-with an empty FOLLOWER_URL so commits don't try to replicate over the
-network.
-"""
 import importlib
 import os
 import tempfile

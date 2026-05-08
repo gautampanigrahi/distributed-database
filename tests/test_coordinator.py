@@ -1,10 +1,3 @@
-"""Coordinator 2PC orchestration tests.
-
-We don't spin up real shard servers here; instead we monkey-patch
-`httpx.post` / `httpx.get` on the coordinator module to route requests
-to an in-memory fake whose state we can inspect. That keeps the test
-fast and lets us control prepare-vote outcomes deterministically.
-"""
 import importlib
 import os
 import tempfile

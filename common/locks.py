@@ -1,20 +1,3 @@
-"""Strict two-phase lock manager with timeout-based deadlock handling.
-
-Lock granularity is one item = (shard_id, key). Two compatibility modes:
-    S (shared, for reads) and X (exclusive, for writes).
-        S/S compatible
-        anything else conflicts (X/S, S/X, X/X)
-
-Strict 2PL: a transaction releases ALL its locks at once on commit/abort
-(release_all). We do NOT build a waits-for graph — instead a waiter
-that exceeds `timeout_s` raises DeadlockTimeout, the coordinator catches
-it and aborts that transaction. This is the standard "presumed
-deadlock" approach (textbook slide 48: "Timeout: abort Xact if it
-waits too long").
-
-Concurrency: a single Condition guards all state. Coordinator endpoints
-run inside FastAPI's threadpool, so a blocking acquire() is fine.
-"""
 import threading
 import time
 from collections import defaultdict

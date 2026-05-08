@@ -1,18 +1,3 @@
-"""Shard node: behaves as leader OR follower (chosen by ROLE env var).
-
-Acts as a 2PC participant for the coordinator:
-    /write         → stage updates in memory (no log yet)
-    /prepare       → log <prepare T, updates>, fsync, vote ready
-    /commit        → log <commit T>, replicate to follower, apply
-    /abort         → log <abort T>, drop staged/prepared
-    /replicate     → leader pushes committed updates to its follower
-
-Recovery: on import, the WAL is replayed to rebuild committed/prepared
-state. Any txn with a <prepare T> but no <commit T>/<abort T> is left
-in-doubt and exposed via /status; the coordinator resolves it.
-
-Failover: a follower can be promoted to leader via /promote.
-"""
 import os
 import threading
 import time

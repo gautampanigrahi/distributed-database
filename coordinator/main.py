@@ -1,21 +1,3 @@
-"""Coordinator: client-facing API + transaction coordinator.
-
-Responsibilities (mirroring the textbook's "transaction coordinator"):
-
-  1. Routing       — sha256(key) % N picks the shard for each key.
-  2. Concurrency   — strict two-phase locking on every read/write.
-                     Deadlocks are broken by timeout (presumed deadlock).
-  3. 2PC           — /commit runs Phase 1 (/prepare to every shard),
-                     persists a single decision in the WAL, then runs
-                     Phase 2 (/commit or /abort to each shard).
-  4. Recovery      — on startup, every recorded decision is re-broadcast
-                     (idempotent), and any shard's in-doubt prepared txn
-                     with no logged decision is presumed-aborted.
-  5. Failover      — a heartbeat task pings each leader; after K failures
-                     the follower is /promoted and the shard map updated.
-
-Everything below is organised in roughly that order.
-"""
 import asyncio
 import os
 import threading
